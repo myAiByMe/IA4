@@ -1,0 +1,30 @@
+# HessGPT — Requirements
+# Python 3.10+  |  CUDA 12.8+  |  B200 Blackwell SM100
+
+# ── Core ──────────────────────────────────────────────────────
+torch>=2.6.0                  # FA4 SDPA, fused AdamW, torch.compile, TF32
+torchvision>=0.21.0
+
+# ── HuggingFace ───────────────────────────────────────────────
+transformers>=4.40.0          # AutoTokenizer, LLaMA-3 tokenizer
+datasets>=2.19.0              # load_dataset, streaming
+huggingface-hub>=0.23.0
+
+# ── Tokenizer backend ─────────────────────────────────────────
+tokenizers>=0.19.0
+
+# ── Utilitaires training ──────────────────────────────────────
+tqdm>=4.66.0
+numpy>=1.26.0
+
+# ── Flash Attention 4 (Blackwell B200 SM100) ──────────────────
+# Obligatoire pour FA4 varlen (sequence packing) + gains ~2.5x vs FA2
+# Compiler depuis source pour SM100 :
+#   pip install flash-attn --no-build-isolation
+# Ou wheel précompilé si dispo :
+#   pip install flash-attn>=3.0.0
+flash-attn>=3.0.0
+
+# ── Optionnel ─────────────────────────────────────────────────
+# bitsandbytes>=0.43.0        # QLoRA uniquement
+# zstandard>=0.22.0           # downloader dataset (déjà géré auto)
