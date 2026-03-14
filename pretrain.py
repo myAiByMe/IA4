@@ -749,9 +749,13 @@ def train_one_chunk(
 
             if batch_idx % 20 == 0:
                 avg = running_loss / max(running_batches, 1)
-                elapsed_so_far = time.time() - t_start
-                tokens_so_far  = (batch_idx + 1) * CONFIG['batch_size'] * CONFIG['max_seq_len']
-                tok_per_sec    = tokens_so_far / max(elapsed_so_far, 1e-6)
+                # Fenêtre glissante 50 batches — ignore le temps de compile
+                _spd_tokens += CONFIG['batch_size'] * CONFIG['max_seq_len']
+                _spd_elapsed = time.time() - _spd_t0
+                tok_per_sec  = _spd_tokens / max(_spd_elapsed, 1e-6)
+                if _spd_elapsed > 30.0:   # reset toutes les 30s
+                    _spd_t0     = time.time()
+                    _spd_tokens = 0
                 pbar.set_postfix(
                     loss=f'{raw:.4f}', avg=f'{avg:.4f}',
                     ppl=f'{math.exp(min(avg,10)):.1f}',
