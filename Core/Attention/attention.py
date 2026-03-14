@@ -46,7 +46,7 @@ def _detect_flash_attn():
         if version >= (3, 0):
             if torch.cuda.is_available():
                 cap = torch.cuda.get_device_capability()
-                if cap[0] >= 10:  # SM100 = Blackwell B200
+                if cap == (12, 0) or cap[0] > 12:  # SM120 = Blackwell B200
                     try:
                         from flash_attn.flash_attn_interface import (
                             flash_attn_func,
@@ -55,11 +55,11 @@ def _detect_flash_attn():
                         _FA_FUNC        = flash_attn_func
                         _FA_VARLEN_FUNC = flash_attn_varlen_func
                         _FA_LEVEL       = 4
-                        print("  ⚡ FlashAttention-4 (Blackwell SM100) détecté")
+                        print("  ⚡ FlashAttention-4 (Blackwell SM120) détecté")
                         return
                     except ImportError:
                         pass
-                # FA3 — SM90 Hopper
+                # FA3 — SM90 Hopper / SM89 Ada
                 if cap[0] >= 9:
                     try:
                         from flash_attn.flash_attn_interface import (
@@ -363,6 +363,11 @@ class MultiHeadAttention(nn.Module):
               and mask is None):
             # ── Chemin FA2/FA3/FA4 standard ──────────────────────
             # flash_attn_func attend : [B, S, H, D]
+            # FA2 refuse float32 — cast en bf16 si nécessaire
+            if q.dtype == torch.float32:
+                q = q.to(torch.bfloat16)
+                k = k.to(torch.bfloat16)
+                v = v.to(torch.bfloat16)
             q_fa = q.transpose(1, 2)
             k_fa = k.transpose(1, 2)
             v_fa = v.transpose(1, 2)
