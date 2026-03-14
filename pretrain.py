@@ -66,7 +66,7 @@ CONFIG = {
     'use_rope':              True,
     'use_yarn':              False,
     'yarn_scale':            4.0,
-    'yarn_original_max_len': 512,
+    'yarn_original_max_len': 1024,
     'use_swiglu':            True,
     'n_kv_heads':            5,
     'use_qk_norm':           True,
