@@ -172,26 +172,18 @@ class HessGPT(nn.Module):
         pad_token_id : Optional[int]             = None,
         past_kv      : Optional[List[KVCache]]   = None,
         use_kv_cache : bool                      = False,
+        # ── Sequence Packing ────────────────────────────────────
+        cu_seqlens_q : Optional[torch.Tensor]    = None,
+        cu_seqlens_k : Optional[torch.Tensor]    = None,
+        max_seqlen_q : Optional[int]             = None,
+        max_seqlen_k : Optional[int]             = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[List[KVCache]]]:
-        """
-        Args:
-            input_ids    : [batch, seq_len]
-            targets      : [batch, seq_len] — optionnel, pour le calcul de la loss
-            pad_token_id : token ignoré dans la loss
-            past_kv      : List[KVCache] de longueur num_layers — None en training
-            use_kv_cache : si True, retourne new_past_kv
-
-        Returns:
-            logits      : [batch, seq_len, vocab_size]
-            loss        : scalar ou None
-            new_past_kv : List[KVCache] mis à jour, ou None
-        """
         batch_size, seq_len = input_ids.shape
         device = input_ids.device
 
         # ── Embeddings ───────────────────────────────────────────
         token_embeds = self.token_embeddings(input_ids)
-        # FA2/FA3/FA4 refusent float32 — cast en bf16 si GPU
+        # FA2 refuse float32 — cast en bf16 si GPU
         if token_embeds.device.type == 'cuda' and token_embeds.dtype == torch.float32:
             token_embeds = token_embeds.to(torch.bfloat16)
 
@@ -205,12 +197,14 @@ class HessGPT(nn.Module):
             x          = self.dropout(token_embeds + pos_embeds)
 
         # ── Masque causal ────────────────────────────────────────
-        # Source de vérité = premier block (évite désync runtime)
-        # En decode avec KV cache (seq_len=1) : pas de masque nécessaire
+        # Si FA2 dispo et pas de soft_cap → pas de masque manuel
+        use_fa = (self.blocks[0].attention._fa_level >= 2
+                  and self.use_flash_attn
+                  and self.soft_cap is None
+                  and cu_seqlens_q is None)
         mask = None
-        if not self.blocks[0].attention.use_flash_attn:
-            if seq_len > 1:
-                mask = self._get_causal_mask(seq_len, device)
+        if not use_fa and seq_len > 1:
+            mask = self._get_causal_mask(seq_len, device)
 
         # ── Transformer Blocks ───────────────────────────────────
         new_past_kv: Optional[List[KVCache]] = [] if use_kv_cache else None
@@ -222,6 +216,10 @@ class HessGPT(nn.Module):
                 mask         = mask,
                 past_kv      = layer_past,
                 use_kv_cache = use_kv_cache,
+                cu_seqlens_q = cu_seqlens_q,
+                cu_seqlens_k = cu_seqlens_k,
+                max_seqlen_q = max_seqlen_q,
+                max_seqlen_k = max_seqlen_k,
             )
             if use_kv_cache:
                 new_past_kv.append(new_kv)
