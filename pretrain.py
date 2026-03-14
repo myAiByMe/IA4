@@ -665,9 +665,11 @@ def train_one_chunk(
     chunk_loss, valid_batches     = 0.0, 0
     accumulated_steps             = 0
     running_loss, running_batches = 0.0, 0
-    t_start = time.time()
-    ae  = (device == 'cuda')
-    adt = torch.bfloat16 if ae else torch.float32
+    t_start     = time.time()
+    ae          = (device == 'cuda')
+    adt         = torch.bfloat16 if ae else torch.float32
+    _spd_t0     = time.time()
+    _spd_tokens = 0
 
     pbar = tqdm(train_loader, desc=label, leave=True,
                 initial=total_batches - num_batches, total=total_batches)
