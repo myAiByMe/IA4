@@ -933,17 +933,6 @@ def main():
     total_params = sum(p.numel() for p in model.parameters())
     print(f"  Params : {total_params/1e6:.1f}M")
 
-    # ── BENCHMARK PHASE 0 (baseline avant compile) ───────────────
-    if device == 'cuda':
-        print(f"\n{'='*60}")
-        print(f"  BENCHMARK PHASE 0 — Baseline BF16 (avant compile)")
-        bm_baseline = run_benchmark(
-            model, CONFIG['vocab_size'],
-            CONFIG['max_seq_len'], min(CONFIG['batch_size'], 32),
-            steps=CONFIG['benchmark_steps'], use_fp8=False,
-        )
-        print_benchmark("Phase 0 — BF16 no compile", bm_baseline)
-
     if CONFIG['use_compile'] and device == 'cuda':
         print('torch.compile...')
         import torch._dynamo
@@ -955,43 +944,38 @@ def main():
         except Exception as e:
             print(f'  FAIL : {e}')
 
-    # ── BENCHMARK PHASE 1 (BF16 + compile) ───────────────────────
-    if device == 'cuda':
-        print(f"\n{'='*60}")
-        print(f"  BENCHMARK PHASE 1 — BF16 + FA2 + compile")
-        dummy = torch.randint(0, CONFIG['vocab_size'],
-                              (4, CONFIG['max_seq_len']), device=device)
-        with torch.amp.autocast(device, dtype=torch.bfloat16):
-            model(dummy)
-        torch.cuda.synchronize()
-
-        bm_phase1 = run_benchmark(
-            model, CONFIG['vocab_size'],
-            CONFIG['max_seq_len'], min(CONFIG['batch_size'], 32),
-            steps=CONFIG['benchmark_steps'], use_fp8=False,
-        )
-        print_benchmark("Phase 1 — BF16 + FA2 + compile", bm_phase1)
-
-    # ── BENCHMARK PHASE 2 (FP8 + compile) ────────────────────────
+    # ── BENCHMARK PHASE 2 — FP8 + FA2 + compile ──────────────────
     if device == 'cuda' and CONFIG['use_fp8']:
         print(f"\n{'='*60}")
         print(f"  BENCHMARK PHASE 2 — FP8 + FA2 + compile")
+        # Warmup compile
+        dummy = torch.randint(0, CONFIG['vocab_size'],
+                              (4, CONFIG['max_seq_len']), device=device)
+        if _TE_AVAILABLE:
+            fp8_recipe_w = DelayedScaling(
+                fp8_format=Format.HYBRID,
+                amax_history_len=16,
+                amax_compute_algo='max',
+            )
+            with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe_w):
+                with torch.amp.autocast(device, dtype=torch.bfloat16):
+                    model(dummy)
+        else:
+            with torch.amp.autocast(device, dtype=torch.bfloat16):
+                model(dummy)
+        torch.cuda.synchronize()
+
         bm_phase2 = run_benchmark(
             model, CONFIG['vocab_size'],
             CONFIG['max_seq_len'], min(CONFIG['batch_size'], 32),
             steps=CONFIG['benchmark_steps'], use_fp8=True,
         )
         print_benchmark("Phase 2 — FP8 + FA2 + compile", bm_phase2)
-
-        if 'bm_baseline' in dir():
-            s1 = bm_phase1['tokens_per_sec'] / bm_baseline['tokens_per_sec']
-            s2 = bm_phase2['tokens_per_sec'] / bm_baseline['tokens_per_sec']
-            print(f"\n  Speedup Phase1 (BF16+compile) vs Phase0 : {s1:.2f}x")
-            print(f"  Speedup Phase2 (FP8+compile)  vs Phase0 : {s2:.2f}x")
-            print(f"  Speedup Phase2 vs Phase1       : {bm_phase2['tokens_per_sec']/bm_phase1['tokens_per_sec']:.2f}x")
-            print(f"  MFU Phase0 : {bm_baseline['mfu_pct']:.1f}%")
-            print(f"  MFU Phase1 : {bm_phase1['mfu_pct']:.1f}%")
-            print(f"  MFU Phase2 : {bm_phase2['mfu_pct']:.1f}%  [{bm_phase2['fp8_backend']}]")
+        # Référence Phase 1 connue : 693K tok/s (mesuré session précédente)
+        ref_phase1 = 693_893
+        speedup = bm_phase2['tokens_per_sec'] / ref_phase1
+        print(f"\n  Speedup Phase2 vs Phase1 (réf 693K) : {speedup:.2f}x")
+        print(f"  MFU Phase2 : {bm_phase2['mfu_pct']:.1f}%  [{bm_phase2['fp8_backend']}]")
 
     raw_model  = model._orig_mod if hasattr(model, '_orig_mod') else model
     optimizers = configure_optimizers(
@@ -1012,9 +996,8 @@ def main():
         'epochs': [], 'start_time': datetime.now().isoformat(),
         'benchmarks': {},
     }
-    if device == 'cuda' and 'bm_baseline' in dir():
-        training_history['benchmarks']['phase0'] = bm_baseline
-        training_history['benchmarks']['phase1'] = bm_phase1
+    if device == 'cuda' and 'bm_phase2' in dir():
+        training_history['benchmarks']['phase2'] = bm_phase2
 
     global_step, current_epoch     = 0, 1
     chunk_within_epoch              = 0
