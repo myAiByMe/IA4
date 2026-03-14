@@ -21,7 +21,4 @@ numpy>=1.26.0
 # wheel précompilé — pas de compilation CUDA requise
 flash-attn==2.8.3
 
-# ── Transformer Engine — FP8 natif Blackwell ──────────────────
-# Kernels FP8 optimisés NVIDIA pour B200 SM100
-# Donne accès aux ~9 PFLOPS FP8 théoriques du B200
-transformer-engine[pytorch]>=1.7.0
+
