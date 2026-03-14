@@ -53,23 +53,8 @@ sys.path.append('./Core/TransformerBlock')
 SPECIAL_TOKENS = ['<think>', '</think>']
 
 print("=" * 80)
-print("HessGPT v9 — Phase 2 : FP8 + FA2 + Sequence Packing + torch.compile")
+print("HessGPT v9 — BF16 + FA2 + Sequence Packing + torch.compile")
 print("=" * 80)
-
-# ── Détection Transformer Engine ────────────────────────────────
-_TE_AVAILABLE = False
-try:
-    import transformer_engine.pytorch as te
-    from transformer_engine.common.recipe import Format, DelayedScaling
-    _TE_AVAILABLE = True
-    print("  ✅ Transformer Engine détecté — FP8 natif Blackwell activé")
-except ImportError:
-    print("  ⚠️  Transformer Engine non dispo — fallback torch FP8 natif")
-    try:
-        _ = torch.float8_e4m3fn
-        print("  ✅ torch FP8 natif disponible (float8_e4m3fn)")
-    except AttributeError:
-        print("  ❌ Aucun FP8 — vérifiez torch >= 2.1")
 
 CONFIG = {
     'vocab_size':            None,
@@ -111,11 +96,8 @@ CONFIG = {
     'compile_mode':          'default',
     'num_workers':           1,
     # ── Sequence Packing ────────────────────────────────────────
-    'use_packing':           True,
-    # ── FP8 ─────────────────────────────────────────────────────
-    'use_fp8':               True,    # False = BF16 (phase 1)
+    'use_packing':           True,   # False = comportement v8 (padding classique)
     # ── Benchmark ───────────────────────────────────────────────
-    'benchmark_steps':       20,
 }
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -425,89 +407,7 @@ class LazyChunkDataset:
         print(f"  RAM chunk libérée")
 
 
-# ============================================================
-# BENCHMARK — tokens/sec + MFU
-# ============================================================
-def estimate_model_flops(model, seq_len):
-    N = sum(p.numel() for p in model.parameters())
-    return 6 * N * seq_len
 
-
-@torch.no_grad()
-def run_benchmark(model, vocab_size, seq_len, batch_size, steps=20,
-                  dtype=torch.bfloat16, use_fp8=False):
-    model.eval()
-    gpu_tflops = 1.0
-    if torch.cuda.is_available():
-        cap = torch.cuda.get_device_capability()
-        if cap[0] >= 10:
-            # B200 : 9 PFLOPS FP8, 4.5 PFLOPS BF16
-            gpu_tflops = 9000.0 if use_fp8 else 4500.0
-        elif cap[0] >= 9:
-            gpu_tflops = 3958.0 if use_fp8 else 1979.0
-        elif cap[0] >= 8:
-            gpu_tflops = 624.0  if use_fp8 else 312.0
-
-    flops_per_fwd = estimate_model_flops(model, seq_len)
-    x = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
-
-    # Cast modèle en bf16 pour FA2
-    model_dtype = next(model.parameters()).dtype
-    if model_dtype == torch.float32:
-        model = model.to(torch.bfloat16)
-
-    def _forward():
-        if use_fp8 and _TE_AVAILABLE:
-            fp8_recipe = DelayedScaling(
-                fp8_format        = Format.HYBRID,
-                amax_history_len  = 16,
-                amax_compute_algo = 'max',
-            )
-            with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
-                with torch.amp.autocast(device, dtype=torch.bfloat16):
-                    model(x)
-        elif use_fp8 and not _TE_AVAILABLE:
-            # Fallback : torch autocast BF16 (FP8 sans TE = pas supporté proprement)
-            with torch.amp.autocast(device, dtype=torch.bfloat16):
-                model(x)
-        else:
-            with torch.amp.autocast(device, dtype=dtype):
-                model(x)
-
-    # Warmup
-    for _ in range(3):
-        _forward()
-    torch.cuda.synchronize()
-
-    t0 = time.time()
-    for _ in range(steps):
-        _forward()
-    torch.cuda.synchronize()
-    elapsed = time.time() - t0
-
-    total_tokens   = batch_size * seq_len * steps
-    tokens_per_sec = total_tokens / elapsed
-    flops_per_sec  = flops_per_fwd * batch_size * steps / elapsed
-    mfu = flops_per_sec / (gpu_tflops * 1e12) * 100
-
-    model.train()
-    return {
-        'tokens_per_sec': tokens_per_sec,
-        'mfu_pct':        mfu,
-        'elapsed_steps':  steps,
-        'dtype':          'fp8' if use_fp8 else str(dtype),
-        'fp8_backend':    'transformer_engine' if (_TE_AVAILABLE and use_fp8)
-                          else ('torch_native' if use_fp8 else 'none'),
-    }
-
-
-def print_benchmark(label, metrics):
-    print(f"\n{'─'*60}")
-    print(f"  BENCHMARK : {label}")
-    print(f"  tokens/sec : {metrics['tokens_per_sec']:,.0f}")
-    print(f"  MFU        : {metrics['mfu_pct']:.1f}%")
-    print(f"  dtype      : {metrics['dtype']}")
-    print(f"{'─'*60}")
 
 
 # ============================================================
@@ -769,20 +669,6 @@ def train_one_chunk(
     ae  = (device == 'cuda')
     adt = torch.bfloat16 if ae else torch.float32
 
-    # ── Context manager selon mode ───────────────────────────────
-    if CONFIG.get('use_fp8') and _TE_AVAILABLE:
-        fp8_recipe = DelayedScaling(
-            fp8_format        = Format.HYBRID,
-            amax_history_len  = 16,
-            amax_compute_algo = 'max',
-        )
-        def _train_ctx():
-            return te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe)
-    else:
-        import contextlib
-        def _train_ctx():
-            return torch.amp.autocast(device, dtype=adt, enabled=ae)
-
     pbar = tqdm(train_loader, desc=label, leave=True,
                 initial=total_batches - num_batches, total=total_batches)
 
@@ -801,7 +687,7 @@ def train_one_chunk(
                 cu_seqlens  = None
                 max_seqlen  = None
 
-            with _train_ctx():
+            with torch.amp.autocast(device, dtype=adt, enabled=ae):
                 _, loss, _ = model(
                     x, targets=y,
                     pad_token_id = tokenizer.pad_token_id,
@@ -863,10 +749,14 @@ def train_one_chunk(
 
             if batch_idx % 20 == 0:
                 avg = running_loss / max(running_batches, 1)
+                elapsed_so_far = time.time() - t_start
+                tokens_so_far  = (batch_idx + 1) * CONFIG['batch_size'] * CONFIG['max_seq_len']
+                tok_per_sec    = tokens_so_far / max(elapsed_so_far, 1e-6)
                 pbar.set_postfix(
                     loss=f'{raw:.4f}', avg=f'{avg:.4f}',
                     ppl=f'{math.exp(min(avg,10)):.1f}',
                     lr=f'{scheduler.get_last_lr()[0]:.2e}',
+                    tok_s=f'{tok_per_sec/1e3:.0f}K',
                     step=f'{global_step:,}',
                 )
 
@@ -944,39 +834,6 @@ def main():
         except Exception as e:
             print(f'  FAIL : {e}')
 
-    # ── BENCHMARK PHASE 2 — FP8 + FA2 + compile ──────────────────
-    if device == 'cuda' and CONFIG['use_fp8']:
-        print(f"\n{'='*60}")
-        print(f"  BENCHMARK PHASE 2 — FP8 + FA2 + compile")
-        # Warmup compile
-        dummy = torch.randint(0, CONFIG['vocab_size'],
-                              (4, CONFIG['max_seq_len']), device=device)
-        if _TE_AVAILABLE:
-            fp8_recipe_w = DelayedScaling(
-                fp8_format=Format.HYBRID,
-                amax_history_len=16,
-                amax_compute_algo='max',
-            )
-            with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe_w):
-                with torch.amp.autocast(device, dtype=torch.bfloat16):
-                    model(dummy)
-        else:
-            with torch.amp.autocast(device, dtype=torch.bfloat16):
-                model(dummy)
-        torch.cuda.synchronize()
-
-        bm_phase2 = run_benchmark(
-            model, CONFIG['vocab_size'],
-            CONFIG['max_seq_len'], min(CONFIG['batch_size'], 32),
-            steps=CONFIG['benchmark_steps'], use_fp8=True,
-        )
-        print_benchmark("Phase 2 — FP8 + FA2 + compile", bm_phase2)
-        # Référence Phase 1 connue : 693K tok/s (mesuré session précédente)
-        ref_phase1 = 693_893
-        speedup = bm_phase2['tokens_per_sec'] / ref_phase1
-        print(f"\n  Speedup Phase2 vs Phase1 (réf 693K) : {speedup:.2f}x")
-        print(f"  MFU Phase2 : {bm_phase2['mfu_pct']:.1f}%  [{bm_phase2['fp8_backend']}]")
-
     raw_model  = model._orig_mod if hasattr(model, '_orig_mod') else model
     optimizers = configure_optimizers(
         raw_model, CONFIG['learning_rate'], CONFIG['weight_decay'],
@@ -994,10 +851,7 @@ def main():
         'config': CONFIG, 'total_params': total_params,
         'total_steps': TOTAL_STEPS, 'chunks': [], 'validations': [],
         'epochs': [], 'start_time': datetime.now().isoformat(),
-        'benchmarks': {},
     }
-    if device == 'cuda' and 'bm_phase2' in dir():
-        training_history['benchmarks']['phase2'] = bm_phase2
 
     global_step, current_epoch     = 0, 1
     chunk_within_epoch              = 0
