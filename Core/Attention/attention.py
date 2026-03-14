@@ -336,8 +336,12 @@ class MultiHeadAttention(nn.Module):
 
         if use_varlen:
             # ── Chemin Sequence Packing (varlen) ─────────────────
-            # flash_attn_varlen_func attend : [total_tokens, heads, head_dim]
-            total_q = q.shape[2]  # après transpose : [B, H, S, D]
+            # FA2 refuse float32 — cast bf16 obligatoire
+            if q.dtype == torch.float32:
+                q = q.to(torch.bfloat16)
+                k = k.to(torch.bfloat16)
+                v = v.to(torch.bfloat16)
+            total_q = q.shape[2]
             q_var = q.permute(0, 2, 1, 3).reshape(-1, self.num_heads,  self.head_dim)
             k_var = k.permute(0, 2, 1, 3).reshape(-1, self.num_heads,  self.head_dim)
             v_var = v.permute(0, 2, 1, 3).reshape(-1, self.num_heads,  self.head_dim)
