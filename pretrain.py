@@ -431,9 +431,9 @@ def run_benchmark(model, vocab_size, seq_len, batch_size, steps=20, dtype=torch.
     gpu_tflops = 1.0
     if torch.cuda.is_available():
         cap = torch.cuda.get_device_capability()
-        # B200 SM100 : ~9 PFLOPS FP8, ~4.5 PFLOPS BF16 (théorique)
-        if cap[0] >= 10:
-            gpu_tflops = 4500.0   # BF16 B200
+        # B200 SM120 : ~9 PFLOPS FP8, ~4.5 PFLOPS BF16 (théorique)
+        if cap == (12, 0) or cap[0] > 12:
+            gpu_tflops = 4500.0   # BF16 B200 SM120
         elif cap[0] >= 9:
             gpu_tflops = 1979.0   # BF16 H100 SXM
         elif cap[0] >= 8:
@@ -441,6 +441,11 @@ def run_benchmark(model, vocab_size, seq_len, batch_size, steps=20, dtype=torch.
 
     flops_per_fwd = estimate_model_flops(model, seq_len)
     x = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
+
+    # FA2/FA3/FA4 refusent float32 — cast le modèle en bf16 pour le benchmark
+    model_dtype = next(model.parameters()).dtype
+    if dtype == torch.bfloat16 and model_dtype == torch.float32:
+        model = model.to(torch.bfloat16)
 
     # Warmup
     for _ in range(3):
