@@ -1,10 +1,23 @@
-# HessGpt.py - v9 — Sequence Packing support
+# HessGpt.py - v7 — KV Cache + top_p
 """
-NOUVEAUTÉS v9 :
-  ✅ Sequence Packing : forward accepte cu_seqlens_q/k et les propage à chaque block
-  ✅ FlashAttention-4 : délégué à attention.py (détection automatique)
-  ✅ Baseline benchmark : log tokens/sec + MFU dans forward si profiling=True
-  Tout le reste identique v8 (KV Cache, top_p, weight tying, etc.)
+HessGPT - Architecture Transformer moderne v7
+
+NOUVEAUTÉS v7 :
+  ✅ KV Cache en inférence
+      - Prefill  : premier appel avec le prompt complet, cache initialisé
+      - Decode   : appels suivants avec 1 token, cache concaténé
+      - Mémoire  : cache stocke K/V non-répétés (n_kv_heads) pour économiser la RAM
+      - Format   : List[KVCache] de longueur num_layers, chaque entry = (k, v)
+      - Training : past_kv=None partout → comportement identique à v6
+
+  ✅ top_p (nucleus sampling)
+      - Appliqué après top_k si les deux sont fournis
+      - Trie les probs, cumule, masque tout ce qui dépasse p
+      - Compatible temperature=0 (greedy, top_p ignoré)
+
+BUGS FIXÉS v6 (conservés) :
+  - Masque causal pré-alloué à l'init (compatible torch.compile)
+  - Source de vérité flash : blocks[0].attention.use_flash_attn
 """
 import torch
 import torch.nn as nn
@@ -13,7 +26,7 @@ import math
 from typing import Optional, List, Tuple
 
 from transformer_block import TransformerBlock
-from attention import RMSNorm, KVCache, _FA_LEVEL
+from attention import RMSNorm, KVCache
 
 
 class HessGPT(nn.Module):
@@ -37,15 +50,36 @@ class HessGPT(nn.Module):
     ):
         super().__init__()
 
-        assert vocab_size > 0
-        assert embed_dim % num_heads == 0
-        if n_kv_heads is not None:
-            assert num_heads % n_kv_heads == 0
-            assert embed_dim % n_kv_heads == 0
-        if use_rope and use_yarn:
-            assert 0 < yarn_original_max_len <= max_seq_len
-            assert 0.1 <= yarn_scale <= 16.0
+        # ── Validation ───────────────────────────────────────────
+        assert vocab_size > 0,         "vocab_size must be positive"
+        assert embed_dim > 0,          "embed_dim must be positive"
+        assert num_layers > 0,         "num_layers must be positive"
+        assert max_seq_len > 0,        "max_seq_len must be positive"
+        assert embed_dim % num_heads == 0, \
+            f"embed_dim ({embed_dim}) must be divisible by num_heads ({num_heads})"
 
+        if n_kv_heads is not None:
+            assert n_kv_heads > 0
+            assert num_heads   % n_kv_heads == 0, \
+                f"num_heads ({num_heads}) must be divisible by n_kv_heads ({n_kv_heads})"
+            assert embed_dim % n_kv_heads == 0, \
+                f"embed_dim ({embed_dim}) must be divisible by n_kv_heads ({n_kv_heads})"
+
+        if use_rope and use_yarn:
+            assert yarn_original_max_len > 0
+            assert yarn_original_max_len <= max_seq_len, \
+                f"yarn_original_max_len ({yarn_original_max_len}) must be <= max_seq_len ({max_seq_len})"
+            assert 0.1 <= yarn_scale <= 16.0, \
+                f"yarn_scale must be in [0.1, 16.0], got {yarn_scale}"
+
+        if soft_cap is not None:
+            assert 0 < soft_cap <= 100, \
+                f"soft_cap must be in (0, 100], got {soft_cap}"
+
+        if not use_yarn and yarn_scale != 1.0:
+            print(f"⚠️  Warning: yarn_scale={yarn_scale} ignored (use_yarn=False)")
+
+        # ── Attributs ────────────────────────────────────────────
         self.vocab_size            = vocab_size
         self.embed_dim             = embed_dim
         self.num_heads             = num_heads
@@ -63,9 +97,12 @@ class HessGPT(nn.Module):
 
         # ── Embeddings ───────────────────────────────────────────
         self.token_embeddings = nn.Embedding(vocab_size, embed_dim)
-        self.position_embeddings = (
-            None if use_rope else nn.Embedding(max_seq_len, embed_dim)
-        )
+
+        if not use_rope:
+            self.position_embeddings = nn.Embedding(max_seq_len, embed_dim)
+        else:
+            self.position_embeddings = None
+
         self.dropout = nn.Dropout(dropout)
 
         # ── Transformer Blocks ───────────────────────────────────
@@ -81,28 +118,30 @@ class HessGPT(nn.Module):
                 n_kv_heads            = n_kv_heads,
                 use_qk_norm           = use_qk_norm,
                 use_flash_attn        = use_flash_attn,
-                soft_cap              = soft_cap,
+                soft_cap              = soft_cap,   # ✅ v8 : propagé à chaque layer
             )
             for _ in range(num_layers)
         ])
 
+        # ── Final norm + head ────────────────────────────────────
         self.ln_final    = RMSNorm(embed_dim)
-        self.output_head = nn.Linear(vocab_size, embed_dim, bias=False)
+        self.output_head = nn.Linear(embed_dim, vocab_size, bias=False)
 
-        # Masque causal pré-alloué (compile-safe)
+        # ── Masque causal pré-alloué (compile-safe) ──────────────
+        # Slice [:seq_len, :seq_len] dans forward → pas de logique conditionnelle
+        # que torch.compile pourrait figer.
         causal_mask = torch.triu(
             torch.ones(max_seq_len, max_seq_len, dtype=torch.bool), diagonal=1
         )
         self.register_buffer('_causal_mask', causal_mask, persistent=False)
 
+        # ── Init ─────────────────────────────────────────────────
         self.apply(self._init_weights)
-        # Weight tying
-        self.output_head.weight = self.token_embeddings.weight
+        self.output_head.weight = self.token_embeddings.weight   # weight tying
 
-        fa_names = {0: 'Manuel', 1: 'SDPA', 2: 'FA2', 3: 'FA3', 4: 'FA4'}
-        print(f"  HessGPT v9 | FlashAttention: {fa_names.get(_FA_LEVEL, '?')} "
-              f"(level={_FA_LEVEL})")
-
+    # ─────────────────────────────────────────────────────────────
+    # Init
+    # ─────────────────────────────────────────────────────────────
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
@@ -113,9 +152,19 @@ class HessGPT(nn.Module):
         elif isinstance(module, RMSNorm):
             torch.nn.init.ones_(module.weight)
 
-    def _get_causal_mask(self, seq_len):
+    # ─────────────────────────────────────────────────────────────
+    # Masque causal
+    # ─────────────────────────────────────────────────────────────
+    def _get_causal_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
+        """
+        Retourne un slice du masque pré-alloué [seq_len, seq_len].
+        Pas de branche conditionnelle → compile-safe.
+        """
         return self._causal_mask[:seq_len, :seq_len]
 
+    # ─────────────────────────────────────────────────────────────
+    # Forward
+    # ─────────────────────────────────────────────────────────────
     def forward(
         self,
         input_ids    : torch.Tensor,
@@ -123,30 +172,48 @@ class HessGPT(nn.Module):
         pad_token_id : Optional[int]             = None,
         past_kv      : Optional[List[KVCache]]   = None,
         use_kv_cache : bool                      = False,
-        # ── Sequence Packing ────────────────────────────────────
-        cu_seqlens_q : Optional[torch.Tensor] = None,
-        cu_seqlens_k : Optional[torch.Tensor] = None,
-        max_seqlen_q : Optional[int]          = None,
-        max_seqlen_k : Optional[int]          = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[List[KVCache]]]:
+        """
+        Args:
+            input_ids    : [batch, seq_len]
+            targets      : [batch, seq_len] — optionnel, pour le calcul de la loss
+            pad_token_id : token ignoré dans la loss
+            past_kv      : List[KVCache] de longueur num_layers — None en training
+            use_kv_cache : si True, retourne new_past_kv
 
+        Returns:
+            logits      : [batch, seq_len, vocab_size]
+            loss        : scalar ou None
+            new_past_kv : List[KVCache] mis à jour, ou None
+        """
         batch_size, seq_len = input_ids.shape
+        device = input_ids.device
 
         # ── Embeddings ───────────────────────────────────────────
-        x = self.token_embeddings(input_ids)
-        if self.position_embeddings is not None:
-            pos = torch.arange(seq_len, device=input_ids.device)
-            x   = x + self.position_embeddings(pos)
-        x = self.dropout(x)
+        token_embeds = self.token_embeddings(input_ids)
+        # FA2/FA3/FA4 refusent float32 — cast en bf16 si GPU
+        if token_embeds.device.type == 'cuda' and token_embeds.dtype == torch.float32:
+            token_embeds = token_embeds.to(torch.bfloat16)
 
-        # ── Masque causal (fallback si pas FA) ───────────────────
-        # Si cu_seqlens fournis → FA varlen gère le masque en interne
-        use_fa = (_FA_LEVEL >= 2 and self.use_flash_attn
-                  and self.soft_cap is None and cu_seqlens_q is None)
-        mask = None if use_fa else self._get_causal_mask(seq_len)
+        if self.use_rope:
+            x = self.dropout(token_embeds)
+        else:
+            assert seq_len <= self.max_seq_len, \
+                f"seq_len ({seq_len}) > max_seq_len ({self.max_seq_len})"
+            positions  = torch.arange(0, seq_len, device=device).unsqueeze(0)
+            pos_embeds = self.position_embeddings(positions)
+            x          = self.dropout(token_embeds + pos_embeds)
+
+        # ── Masque causal ────────────────────────────────────────
+        # Source de vérité = premier block (évite désync runtime)
+        # En decode avec KV cache (seq_len=1) : pas de masque nécessaire
+        mask = None
+        if not self.blocks[0].attention.use_flash_attn:
+            if seq_len > 1:
+                mask = self._get_causal_mask(seq_len, device)
 
         # ── Transformer Blocks ───────────────────────────────────
-        new_past_kv = [] if use_kv_cache else None
+        new_past_kv: Optional[List[KVCache]] = [] if use_kv_cache else None
 
         for i, block in enumerate(self.blocks):
             layer_past = past_kv[i] if past_kv is not None else None
@@ -155,10 +222,6 @@ class HessGPT(nn.Module):
                 mask         = mask,
                 past_kv      = layer_past,
                 use_kv_cache = use_kv_cache,
-                cu_seqlens_q = cu_seqlens_q,
-                cu_seqlens_k = cu_seqlens_k,
-                max_seqlen_q = max_seqlen_q,
-                max_seqlen_k = max_seqlen_k,
             )
             if use_kv_cache:
                 new_past_kv.append(new_kv)
@@ -167,13 +230,17 @@ class HessGPT(nn.Module):
         x      = self.ln_final(x)
         logits = self.output_head(x)
 
+        if self.soft_cap is not None:
+            logits = torch.tanh(logits / self.soft_cap) * self.soft_cap
+
         # ── Loss ─────────────────────────────────────────────────
         loss = None
         if targets is not None:
+            ignore_index = pad_token_id if pad_token_id is not None else -100
             loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
+                logits.view(-1, self.vocab_size),
                 targets.view(-1),
-                ignore_index = pad_token_id if pad_token_id is not None else -100,
+                ignore_index=ignore_index,
             )
 
         return logits, loss, new_past_kv
@@ -181,74 +248,147 @@ class HessGPT(nn.Module):
     # ─────────────────────────────────────────────────────────────
     # Génération autoregressive — KV Cache + top_k + top_p
     # ─────────────────────────────────────────────────────────────
-    @torch.no_grad()
     def generate(
         self,
-        input_ids     : torch.Tensor,
-        max_new_tokens: int            = 50,
-        temperature   : float          = 1.0,
-        top_k         : Optional[int]  = None,
-        top_p         : Optional[float]= None,
-        eos_token_id  : Optional[int]  = None,
+        input_ids    : torch.Tensor,
+        max_new_tokens: int   = 50,
+        temperature  : float  = 1.0,
+        top_k        : Optional[int]   = None,
+        top_p        : Optional[float] = None,
+        eos_token_id : Optional[int]   = None,
     ) -> torch.Tensor:
+        """
+        Génération autoregressive avec KV Cache, top_k et top_p.
+
+        Stratégie KV Cache :
+          1. Prefill  : forward sur le prompt complet → cache initialisé
+          2. Decode   : forward sur 1 token à la fois → cache concaténé à chaque step
+
+        Args:
+            input_ids      : [batch, prompt_len]
+            max_new_tokens : nombre maximum de tokens à générer
+            temperature    : température (0.0 = greedy)
+            top_k          : garde les k tokens les plus probables
+            top_p          : nucleus sampling — garde le noyau de proba cumulée >= p
+            eos_token_id   : stop dès que ce token est généré (optionnel)
+
+        Returns:
+            input_ids : [batch, prompt_len + nb_tokens_générés]
+        """
         was_training = self.training
         self.eval()
         device = input_ids.device
 
-        if input_ids.size(1) > self.max_seq_len:
-            input_ids = input_ids[:, -self.max_seq_len:]
+        with torch.no_grad():
 
-        prefill_logits, _, past_kv = self.forward(input_ids, use_kv_cache=True)
-        next_logits = prefill_logits[:, -1, :]
+            # ── Tronquer si prompt dépasse max_seq_len ───────────
+            if input_ids.size(1) > self.max_seq_len:
+                input_ids = input_ids[:, -self.max_seq_len:]
 
-        for _ in range(max_new_tokens):
-            logits = next_logits
+            # ── PREFILL : forward sur le prompt complet ──────────
+            # past_kv=None, use_kv_cache=True → initialise le cache
+            # Les logits[:, -1, :] donnent directement la distribution
+            # du PREMIER token à générer → on ne re-traite pas le
+            # dernier token du prompt dans la boucle de decode.
+            prefill_logits, _, past_kv = self.forward(
+                input_ids,
+                use_kv_cache=True,
+            )
+            # past_kv : List[KVCache], chaque entry = (k, v)
+            #   shape : [batch, n_kv_heads, prompt_len, head_dim]
 
-            if temperature == 0.0:
-                next_token = logits.argmax(dim=-1, keepdim=True)
-            else:
-                logits = logits / temperature
-                if top_k is not None:
-                    k = min(top_k, logits.size(-1))
-                    topk_v, _ = torch.topk(logits, k)
-                    logits = logits.masked_fill(logits < topk_v[:, [-1]], float('-inf'))
-                if top_p is not None and top_p < 1.0:
-                    sorted_logits, sorted_idx = torch.sort(logits, dim=-1, descending=True)
-                    sorted_probs    = F.softmax(sorted_logits, dim=-1)
-                    cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-                    remove_mask     = (cumulative_probs - sorted_probs) >= top_p
-                    sorted_logits   = sorted_logits.masked_fill(remove_mask, float('-inf'))
-                    logits = torch.zeros_like(logits).scatter_(1, sorted_idx, sorted_logits)
-                probs      = F.softmax(logits, dim=-1)
-                next_token = torch.multinomial(probs, num_samples=1)
+            # Logits du premier token à générer (depuis le prefill)
+            next_logits = prefill_logits[:, -1, :]   # [batch, vocab_size]
 
-            input_ids = torch.cat([input_ids, next_token], dim=1)
+            for step in range(max_new_tokens):
 
-            if eos_token_id is not None and (next_token == eos_token_id).all():
-                break
+                logits = next_logits   # [batch, vocab_size]
 
-            decode_logits, _, past_kv = self.forward(
-                next_token, past_kv=past_kv, use_kv_cache=True)
-            next_logits = decode_logits[:, -1, :]
+                # ── Greedy ───────────────────────────────────────
+                if temperature == 0.0:
+                    next_token = logits.argmax(dim=-1, keepdim=True)
+                else:
+                    # ── Temperature ──────────────────────────────
+                    logits = logits / temperature
+
+                    # ── top_k ────────────────────────────────────
+                    if top_k is not None:
+                        k         = min(top_k, logits.size(-1))
+                        topk_v, _ = torch.topk(logits, k)
+                        logits    = logits.masked_fill(logits < topk_v[:, [-1]], float('-inf'))
+
+                    # ── top_p (nucleus sampling) ──────────────────
+                    # Appliqué après top_k si les deux sont fournis.
+                    # Algorithme :
+                    #   1. Trier les logits par ordre décroissant
+                    #   2. Convertir en probs (softmax)
+                    #   3. Calculer la somme cumulée
+                    #   4. Masquer tout ce qui fait dépasser le seuil p
+                    #   5. Remettre dans l'ordre original
+                    if top_p is not None and top_p < 1.0:
+                        sorted_logits, sorted_idx = torch.sort(logits, dim=-1, descending=True)
+                        sorted_probs              = F.softmax(sorted_logits, dim=-1)
+                        cumulative_probs          = torch.cumsum(sorted_probs, dim=-1)
+
+                        # Décaler d'un cran pour inclure le premier token qui dépasse p
+                        # Ex: probs=[0.6, 0.3, 0.1], p=0.8
+                        #   cumsum = [0.6, 0.9, 1.0]
+                        #   shifted = [0.0, 0.6, 0.9]
+                        #   mask    = [F,   F,   T]   → garde les 2 premiers ✅
+                        remove_mask   = (cumulative_probs - sorted_probs) >= top_p
+                        sorted_logits = sorted_logits.masked_fill(remove_mask, float('-inf'))
+
+                        # Remettre dans l'ordre original des tokens
+                        logits = torch.zeros_like(logits).scatter_(
+                            dim=1, index=sorted_idx, src=sorted_logits
+                        )
+
+                    # ── Sampling ─────────────────────────────────
+                    probs      = F.softmax(logits, dim=-1)
+                    next_token = torch.multinomial(probs, num_samples=1)   # [batch, 1]
+
+                input_ids = torch.cat([input_ids, next_token], dim=1)
+
+                # ── Stop sur EOS ─────────────────────────────────
+                if eos_token_id is not None and (next_token == eos_token_id).all():
+                    break
+
+                # ── DECODE : forward sur le token généré ─────────
+                # Met à jour next_logits ET past_kv pour le step suivant.
+                # C'est ici que le KV cache est utilisé : on ne passe que
+                # 1 token, le cache contient tout le contexte précédent.
+                decode_logits, _, past_kv = self.forward(
+                    next_token,
+                    past_kv      = past_kv,
+                    use_kv_cache = True,
+                )
+                next_logits = decode_logits[:, -1, :]   # [batch, vocab_size]
 
         if was_training:
             self.train()
+
         return input_ids
 
-    # ── Utilitaires ──────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────
+    # Utilitaires
+    # ─────────────────────────────────────────────────────────────
     def resize_token_embeddings(self, new_vocab_size: int):
         if new_vocab_size == self.vocab_size:
             return
+        print(f"📝 Resizing embeddings: {self.vocab_size} → {new_vocab_size}")
+
         old_emb = self.token_embeddings
         self.token_embeddings = nn.Embedding(new_vocab_size, self.embed_dim)
         n = min(old_emb.num_embeddings, new_vocab_size)
         with torch.no_grad():
             self.token_embeddings.weight.data[:n] = old_emb.weight.data[:n]
+
         self.output_head        = nn.Linear(self.embed_dim, new_vocab_size, bias=False)
         self.output_head.weight = self.token_embeddings.weight
         self.vocab_size         = new_vocab_size
+        print(f"   ✅ Embeddings resized to {new_vocab_size}")
 
-    def count_parameters(self):
+    def count_parameters(self) -> dict:
         token_params = self.token_embeddings.weight.numel()
         pos_params   = (self.position_embeddings.weight.numel()
                         if self.position_embeddings is not None else 0)
@@ -264,7 +404,7 @@ class HessGPT(nn.Module):
             'total':               total,
         }
 
-    def get_config(self):
+    def get_config(self) -> dict:
         return {
             'vocab_size':            self.vocab_size,
             'embed_dim':             self.embed_dim,
