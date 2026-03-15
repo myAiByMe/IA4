@@ -68,14 +68,14 @@ CONFIG = {
     'use_rope':              True,
     'use_yarn':              True,        # ✅ v10 : YaRN activé pour max_seq_len > 512
     'yarn_scale':            4.0,         # 512 * 4 = 2048
-    'yarn_original_max_len': 512,         # longueur de training de base
+    'yarn_original_max_len': 2048,         # longueur de training de base
     'use_swiglu':            True,
     'n_kv_heads':            5,
     'use_qk_norm':           True,
     'soft_cap':              None,
     'use_flash_attn':        True,
     'use_gradient_checkpointing': True,   # ✅ v10 : ~50% VRAM, +30% compute
-    'batch_size':            16,        # ✅ v10 : réduit pour seq_len=2048 (OOM fix)
+    'batch_size':            32,        # ✅ v10 : réduit pour seq_len=2048 (OOM fix)
     'gradient_accumulation': 32,       # batch effectif = 16*32 = 512 séquences
     'max_grad_norm':         1.0,
     'learning_rate':         4e-4,
