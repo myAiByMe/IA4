@@ -24,7 +24,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 from typing import Optional, List, Tuple
-from torch.utils.checkpoint import checkpoint as gradient_checkpoint
 
 from transformer_block import TransformerBlock
 from attention import RMSNorm, KVCache
@@ -48,7 +47,6 @@ class HessGPT(nn.Module):
         use_qk_norm           = False,
         soft_cap              = None,
         use_flash_attn        = True,
-        use_gradient_checkpointing = False,  # ✅ v10 : économise ~50% VRAM (+30% compute)
     ):
         super().__init__()
 
@@ -95,8 +93,7 @@ class HessGPT(nn.Module):
         self.n_kv_heads            = n_kv_heads
         self.use_qk_norm           = use_qk_norm
         self.soft_cap              = soft_cap
-        self.use_flash_attn               = use_flash_attn
-        self.use_gradient_checkpointing   = use_gradient_checkpointing
+        self.use_flash_attn        = use_flash_attn
 
         # ── Embeddings ───────────────────────────────────────────
         self.token_embeddings = nn.Embedding(vocab_size, embed_dim)
@@ -212,46 +209,18 @@ class HessGPT(nn.Module):
         # ── Transformer Blocks ───────────────────────────────────
         new_past_kv: Optional[List[KVCache]] = [] if use_kv_cache else None
 
-        # Activation checkpointing : recompute forward au backward
-        # → économise ~50% VRAM au prix de ~30% de compute supplémentaire.
-        # Désactivé en inférence (use_kv_cache=True) ou si non configuré.
-        use_ckpt = (self.use_gradient_checkpointing
-                    and self.training
-                    and not use_kv_cache)
-
         for i, block in enumerate(self.blocks):
             layer_past = past_kv[i] if past_kv is not None else None
-
-            if use_ckpt:
-                # gradient_checkpoint ne supporte pas les kwargs → wrapper lambda
-                def make_block_fn(b):
-                    def block_fn(x_in):
-                        out, _ = b(
-                            x_in,
-                            mask         = mask,
-                            past_kv      = None,
-                            use_kv_cache = False,
-                            cu_seqlens_q = cu_seqlens_q,
-                            cu_seqlens_k = cu_seqlens_k,
-                            max_seqlen_q = max_seqlen_q,
-                            max_seqlen_k = max_seqlen_k,
-                        )
-                        return out
-                    return block_fn
-                x = gradient_checkpoint(make_block_fn(block), x, use_reentrant=False)
-                new_kv = None
-            else:
-                x, new_kv = block(
-                    x,
-                    mask         = mask,
-                    past_kv      = layer_past,
-                    use_kv_cache = use_kv_cache,
-                    cu_seqlens_q = cu_seqlens_q,
-                    cu_seqlens_k = cu_seqlens_k,
-                    max_seqlen_q = max_seqlen_q,
-                    max_seqlen_k = max_seqlen_k,
-                )
-
+            x, new_kv  = block(
+                x,
+                mask         = mask,
+                past_kv      = layer_past,
+                use_kv_cache = use_kv_cache,
+                cu_seqlens_q = cu_seqlens_q,
+                cu_seqlens_k = cu_seqlens_k,
+                max_seqlen_q = max_seqlen_q,
+                max_seqlen_k = max_seqlen_k,
+            )
             if use_kv_cache:
                 new_past_kv.append(new_kv)
 
@@ -448,6 +417,5 @@ class HessGPT(nn.Module):
             'n_kv_heads':            self.n_kv_heads,
             'use_qk_norm':           self.use_qk_norm,
             'soft_cap':              self.soft_cap,
-            'use_flash_attn':               self.use_flash_attn,
-            'use_gradient_checkpointing':   self.use_gradient_checkpointing,
+            'use_flash_attn':        self.use_flash_attn,
         }
