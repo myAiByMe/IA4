@@ -63,7 +63,7 @@ CONFIG = {
     'embed_dim':             1280,
     'num_heads':             20,
     'num_layers':            24,
-    'max_seq_len':           2048,       # ✅ v10 : monté à 2048 (YaRN gère l'extension)
+    'max_seq_len':           512,       # ✅ v10 : monté à 2048 (YaRN gère l'extension)
     'dropout':               0.0,
     'use_rope':              True,
     'use_yarn':              True,        # ✅ v10 : YaRN activé pour max_seq_len > 512
@@ -75,7 +75,7 @@ CONFIG = {
     'soft_cap':              None,
     'use_flash_attn':        True,
     'use_gradient_checkpointing': False,  # B200 192GB : pas nécessaire pour 500M
-    'batch_size':            48,        # B200 192GB + seq_len=2048 : OK sans checkpointing
+    'batch_size':            150,        # B200 192GB + seq_len=2048 : OK sans checkpointing
     'gradient_accumulation': 8,        # batch effectif = 48*8 = 384 séquences
     'max_grad_norm':         1.0,
     'learning_rate':         4e-4,
@@ -96,7 +96,7 @@ CONFIG = {
     'save_every_steps':      200,        # ✅ v10 : checkpoint fréquent (runs courts)
     'checkpoint_file':       './Model/HessGpt_pretrain.pt',
     'use_compile':           True,
-    'compile_mode':          'reduce-overhead', # ✅ v10 : optimal pour training répétitif
+    'compile_mode':          'default', # ✅ v10 : optimal pour training répétitif
     'num_workers':           1,
     # ── Sequence Packing ────────────────────────────────────────
     'use_packing':           True,   # False = comportement v8 (padding classique)
