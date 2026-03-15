@@ -68,15 +68,15 @@ CONFIG = {
     'use_rope':              True,
     'use_yarn':              True,        # ✅ v10 : YaRN activé pour max_seq_len > 512
     'yarn_scale':            4.0,         # 512 * 4 = 2048
-    'yarn_original_max_len': 2048,         # longueur de training de base
+    'yarn_original_max_len': 512,         # longueur de training de base
     'use_swiglu':            True,
     'n_kv_heads':            5,
     'use_qk_norm':           True,
     'soft_cap':              None,
     'use_flash_attn':        True,
-    'use_gradient_checkpointing': True,   # ✅ v10 : ~50% VRAM, +30% compute
-    'batch_size':            32,        # ✅ v10 : réduit pour seq_len=2048 (OOM fix)
-    'gradient_accumulation': 32,       # batch effectif = 16*32 = 512 séquences
+    'use_gradient_checkpointing': False,  # B200 192GB : pas nécessaire pour 500M
+    'batch_size':            48,        # B200 192GB + seq_len=2048 : OK sans checkpointing
+    'gradient_accumulation': 8,        # batch effectif = 48*8 = 384 séquences
     'max_grad_norm':         1.0,
     'learning_rate':         4e-4,
     'weight_decay':          0.1,
@@ -96,7 +96,7 @@ CONFIG = {
     'save_every_steps':      200,        # ✅ v10 : checkpoint fréquent (runs courts)
     'checkpoint_file':       './Model/HessGpt_pretrain.pt',
     'use_compile':           True,
-    'compile_mode':          'default',
+    'compile_mode':          'reduce-overhead', # ✅ v10 : optimal pour training répétitif
     'num_workers':           1,
     # ── Sequence Packing ────────────────────────────────────────
     'use_packing':           True,   # False = comportement v8 (padding classique)
@@ -836,10 +836,18 @@ def main():
     if CONFIG['use_compile'] and device == 'cuda':
         print('torch.compile...')
         import torch._dynamo
-        torch._dynamo.config.cache_size_limit = 256
+        # dynamic=True : évite les recompilations sur les shapes variables
+        # (sequence packing génère des cu_seqlens différents à chaque batch)
+        # reduce-overhead : mode optimal pour boucles répétitives, warm-up rapide
+        torch._dynamo.config.cache_size_limit = 64
         torch._dynamo.config.suppress_errors  = True
         try:
-            model = torch.compile(model, mode=CONFIG['compile_mode'])
+            model = torch.compile(
+                model,
+                mode    = CONFIG['compile_mode'],
+                dynamic = True,   # shapes variables → pas de recompilation
+                fullgraph = False, # False = plus robuste avec gradient checkpointing
+            )
             print('  OK')
         except Exception as e:
             print(f'  FAIL : {e}')
