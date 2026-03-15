@@ -1,26 +1,21 @@
 #!/usr/bin/env python3
 """
-HessGPT Pre-Training v9 — Phase 0+1 : Baseline + FA4 + Sequence Packing
+HessGPT Pre-Training v10 — Tokens spéciaux via slots réservés Llama-3
 
-NOUVEAUTÉS v9 :
-  ✅ Sequence Packing : zéro padding, 100% tokens utiles
-      - PackedChunkDataset : pack plusieurs séquences dans un bloc de max_seq_len tokens
-      - cu_seqlens générés automatiquement par le collate_fn
-      - Compatible FA4 varlen (flash_attn_varlen_func)
+CHANGEMENTS v10 vs v9 :
+  ✅ SPECIAL_TOKENS : 8 tokens via slots réservés Llama-3 (128002-128255)
+      - <|think|> / <|/think|>   : raisonnement — SFT + GRPO
+      - <|code|>  / <|/code|>    : bloc code     — Phase 2B + SFT
+      - <|result|>/ <|/result|>  : résultat sandbox
+      - <|error|> / <|/error|>   : erreur sandbox — apprend à corriger
 
-  ✅ Benchmark baseline automatique
-      - Mesure tokens/sec + MFU (Model FLOPs Utilization) au démarrage
-      - Log comparatif : avant/après chaque phase
-      - MFU = flops_réels / (flops_théoriques_GPU * temps)
+  ✅ Tokenizer : détection automatique des slots libres
+      - add_special_tokens() trouve les slots sans collision
+      - Sanity check : vérifie qu'aucun ID < 128000
+      - TOK dict global : accès aux IDs sans hardcoding
 
-  ✅ FlashAttention-4 Blackwell
-      - Détection automatique dans attention.py
-      - Aucun changement de code requis ici
-
-  ✅ torch.set_float32_matmul_precision('high')
-      - Active TF32 sur les matmuls → +20% vitesse sur A100/H100/B200 sans perte précision
-
-  Tout le reste identique v8 (Muon+MARS, WSD, KV Cache, checkpoint, etc.)
+  Tout le reste identique v9 (Muon+MARS, WSD, FA2, Sequence Packing,
+  torch.compile, KV Cache, checkpoint, etc.)
 """
 
 import os
@@ -30,7 +25,6 @@ os.environ["TORCHINDUCTOR_FX_GRAPH_CACHE"] = "1"
 os.makedirs("./CompileCache", exist_ok=True)
 
 import torch
-# ── TF32 : +20% vitesse sur Ampere/Hopper/Blackwell, précision quasi-identique BF16
 torch.set_float32_matmul_precision('high')
 
 from torch.utils.data import DataLoader, Dataset
@@ -50,10 +44,18 @@ sys.path.append('./Core/Attention')
 sys.path.append('./Core/FeedForward')
 sys.path.append('./Core/TransformerBlock')
 
-SPECIAL_TOKENS = ['<think>', '</think>']
+# ── Tokens spéciaux — slots réservés Llama-3 (128002-128255) ──────────────
+# Ne jamais hardcoder les IDs : add_special_tokens() trouve les slots libres
+# automatiquement, sans collision avec les tokens natifs Llama-3.
+SPECIAL_TOKENS = [
+    '<|think|>',    '<|/think|>',    # raisonnement   — SFT + GRPO
+    '<|code|>',     '<|/code|>',     # bloc code       — Phase 2B + SFT
+    '<|result|>',   '<|/result|>',   # résultat sandbox
+    '<|error|>',    '<|/error|>',    # erreur sandbox  — apprend à corriger
+]
 
 print("=" * 80)
-print("HessGPT v9 — BF16 + FA2 + Sequence Packing + torch.compile")
+print("HessGPT v10 — BF16 + FA2 + Sequence Packing + torch.compile")
 print("=" * 80)
 
 CONFIG = {
@@ -95,9 +97,7 @@ CONFIG = {
     'use_compile':           True,
     'compile_mode':          'default',
     'num_workers':           1,
-    # ── Sequence Packing ────────────────────────────────────────
-    'use_packing':           True,   # False = comportement v8 (padding classique)
-    # ── Benchmark ───────────────────────────────────────────────
+    'use_packing':           True,
 }
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -180,11 +180,39 @@ print(f"  steps/epoch~={STEPS_PER_EPOCH:,}  total={TOTAL_STEPS:,}")
 # ============================================================
 print(f"\nLoading tokenizer...")
 tokenizer = AutoTokenizer.from_pretrained("NousResearch/Meta-Llama-3-8B")
-tokenizer.add_special_tokens({'additional_special_tokens': SPECIAL_TOKENS})
+
+# ── Vérification des slots avant ajout ──────────────────────
+_existing = set(tokenizer.added_tokens_encoder.keys())
+_to_add   = [t for t in SPECIAL_TOKENS if t not in _existing]
+_already  = [t for t in SPECIAL_TOKENS if t in _existing]
+
+if _already:
+    print(f"  Tokens déjà présents : {_already}")
+if _to_add:
+    tokenizer.add_special_tokens({'additional_special_tokens': _to_add})
+    print(f"  Tokens ajoutés       : {_to_add}")
+
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
+
 CONFIG['vocab_size'] = len(tokenizer)
 print(f"  vocab={len(tokenizer)}")
+
+# ── IDs réels — jamais hardcodés, toujours lus depuis le tokenizer ──────────
+TOK = {t: tokenizer.convert_tokens_to_ids(t) for t in SPECIAL_TOKENS}
+print(f"  IDs tokens spéciaux :")
+for tok, tid in TOK.items():
+    slot = tid - 128000
+    print(f"    {tok:22s} → {tid}  (slot réservé #{slot})")
+
+# Sanity check : aucun ID ne doit être < 128000 (vocab de base Llama-3)
+_conflicts = {t: i for t, i in TOK.items() if i < 128000}
+if _conflicts:
+    raise RuntimeError(
+        f"CONFLIT IDs tokens spéciaux : {_conflicts}\n"
+        f"Ces tokens ont pris des IDs du vocab de base — "
+        f"vérifier tokenizer.added_tokens_encoder"
+    )
 
 
 # ============================================================
@@ -236,7 +264,7 @@ class WSDScheduler:
 # ============================================================
 
 class ChunkSubset(Dataset):
-    """Dataset standard (padding classique, comportement v8)."""
+    """Dataset standard (padding classique)."""
     def __init__(self, tokens, seq_len, pad_token_id):
         self.seq_len      = seq_len
         self.pad_token_id = pad_token_id
@@ -255,18 +283,11 @@ class ChunkSubset(Dataset):
 class PackedChunkDataset(Dataset):
     """
     Sequence Packing : pack plusieurs documents dans un bloc de max_seq_len tokens.
-
-    Principe :
-      - Les tokens sont déjà concaténés dans `tokens` (séquences back-to-back)
-      - On découpe en blocs de max_seq_len tokens (chaque bloc = 1 sample)
-      - Le collate_fn calcule les cu_seqlens à partir des positions EOS dans chaque bloc
-
     Pas de padding → 100% tokens utiles.
     """
     def __init__(self, tokens, seq_len, eos_token_id):
         self.seq_len      = seq_len
         self.eos_token_id = eos_token_id
-        # Nombre de blocs complets
         self.num_samples  = len(tokens) // (seq_len + 1)
         self.tokens       = tokens[:self.num_samples * (seq_len + 1)].share_memory_()
 
@@ -276,8 +297,8 @@ class PackedChunkDataset(Dataset):
     def __getitem__(self, idx):
         start = idx * (self.seq_len + 1)
         block = self.tokens[start : start + self.seq_len + 1]
-        x = block[:-1].clone()   # [seq_len]
-        y = block[1:].clone()    # [seq_len]
+        x = block[:-1].clone()
+        y = block[1:].clone()
         return x, y
 
 
@@ -285,40 +306,28 @@ def packed_collate_fn(batch, eos_token_id, seq_len):
     """
     Collate pour Sequence Packing.
     Calcule cu_seqlens_q en détectant les EOS dans chaque séquence du batch.
-
-    Retourne :
-      x           : [batch, seq_len]
-      y           : [batch, seq_len]
-      cu_seqlens  : [batch * n_seqs_per_sample + 1] int32 — pour flash_attn_varlen
-      max_seqlen  : int — longueur max d'une sous-séquence dans le batch
     """
     xs, ys = zip(*batch)
-    x = torch.stack(xs)   # [B, seq_len]
-    y = torch.stack(ys)   # [B, seq_len]
+    x = torch.stack(xs)
+    y = torch.stack(ys)
 
-    # Calcul cu_seqlens pour chaque item du batch
-    # On concatène les séquences de tout le batch en une seule dim
-    # (c'est ce que flash_attn_varlen_func attend)
     all_cu = [0]
     max_sl = 1
 
     for i in range(x.size(0)):
-        seq = x[i]
-        # Positions des EOS dans cette séquence (début de nouvelle doc)
+        seq     = x[i]
         eos_pos = (seq == eos_token_id).nonzero(as_tuple=True)[0]
         if len(eos_pos) == 0:
-            # Pas d'EOS → toute la séquence est un seul doc
             all_cu.append(all_cu[-1] + seq_len)
             max_sl = max(max_sl, seq_len)
         else:
             prev = 0
             for pos in eos_pos.tolist():
-                l = pos - prev + 1   # +1 pour inclure l'EOS
+                l = pos - prev + 1
                 if l > 0:
                     all_cu.append(all_cu[-1] + l)
                     max_sl = max(max_sl, l)
                 prev = pos + 1
-            # Dernier segment après le dernier EOS
             remaining = seq_len - prev
             if remaining > 0:
                 all_cu.append(all_cu[-1] + remaining)
@@ -396,7 +405,6 @@ class LazyChunkDataset:
         return ChunkSubset(self._train_toks, self.seq_len, self.pad_token_id)
 
     def get_val_dataset(self):
-        # Val toujours en mode standard pour cohérence des métriques
         return ChunkSubset(self._val_toks, self.seq_len, self.pad_token_id)
 
     def unload(self):
@@ -405,9 +413,6 @@ class LazyChunkDataset:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         print(f"  RAM chunk libérée")
-
-
-
 
 
 # ============================================================
@@ -479,7 +484,6 @@ def validate(model, val_loader, max_batches=50):
         for i, batch in enumerate(val_loader):
             if i >= max_batches:
                 break
-            # Val toujours en mode standard (pas de cu_seqlens)
             x, y = batch[0].to(device), batch[1].to(device)
             with torch.amp.autocast(device, dtype=adt, enabled=ae):
                 _, loss, _ = model(x, targets=y, pad_token_id=tokenizer.pad_token_id)
@@ -543,7 +547,7 @@ class Muon(torch.optim.Optimizer):
                     state['momentum_buffer'] = torch.zeros_like(g)
                 buf = state['momentum_buffer']
                 buf.mul_(momentum).add_(g)
-                g = (g + momentum * buf) if nesterov else buf
+                g     = (g + momentum * buf) if nesterov else buf
                 g     = zeropower_via_newtonschulz5(g, steps=ns_steps)
                 scale = max(g.size(0), g.size(1)) ** 0.5
                 g     = g * scale
@@ -634,7 +638,6 @@ def train_one_chunk(
         skip_samples=batches_done * CONFIG['batch_size'],
     )
 
-    # ── DataLoader : collate_fn selon mode ──────────────────────
     if CONFIG['use_packing']:
         from functools import partial
         _collate = partial(
@@ -676,18 +679,17 @@ def train_one_chunk(
 
     for batch_idx, batch in enumerate(pbar):
         try:
-            # ── Unpack batch selon mode ──────────────────────────
             if CONFIG['use_packing'] and len(batch) == 4:
                 x, y, cu_seqlens, max_seqlen = batch
-                x           = x.to(device, non_blocking=True)
-                y           = y.to(device, non_blocking=True)
-                cu_seqlens  = cu_seqlens.to(device, non_blocking=True)
+                x          = x.to(device, non_blocking=True)
+                y          = y.to(device, non_blocking=True)
+                cu_seqlens = cu_seqlens.to(device, non_blocking=True)
             else:
-                x, y = batch[0], batch[1]
-                x    = x.to(device, non_blocking=True)
-                y    = y.to(device, non_blocking=True)
-                cu_seqlens  = None
-                max_seqlen  = None
+                x, y       = batch[0], batch[1]
+                x          = x.to(device, non_blocking=True)
+                y          = y.to(device, non_blocking=True)
+                cu_seqlens = None
+                max_seqlen = None
 
             with torch.amp.autocast(device, dtype=adt, enabled=ae):
                 _, loss, _ = model(
@@ -751,11 +753,10 @@ def train_one_chunk(
 
             if batch_idx % 20 == 0:
                 avg = running_loss / max(running_batches, 1)
-                # Fenêtre glissante 50 batches — ignore le temps de compile
                 _spd_tokens += CONFIG['batch_size'] * CONFIG['max_seq_len']
                 _spd_elapsed = time.time() - _spd_t0
                 tok_per_sec  = _spd_tokens / max(_spd_elapsed, 1e-6)
-                if _spd_elapsed > 30.0:   # reset toutes les 30s
+                if _spd_elapsed > 30.0:
                     _spd_t0     = time.time()
                     _spd_tokens = 0
                 pbar.set_postfix(
@@ -859,10 +860,10 @@ def main():
         'epochs': [], 'start_time': datetime.now().isoformat(),
     }
 
-    global_step, current_epoch     = 0, 1
-    chunk_within_epoch              = 0
-    total_training_time             = 0.0
-    chunk_start_step                = 0
+    global_step, current_epoch = 0, 1
+    chunk_within_epoch         = 0
+    total_training_time        = 0.0
+    chunk_start_step           = 0
 
     cp = ckpt_mgr.load()
     if cp:
