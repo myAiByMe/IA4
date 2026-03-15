@@ -1,25 +1,23 @@
-# attention.py - v9 — Phase 1 : FlashAttention-4 Blackwell + Sequence Packing
+# attention.py - v10 — SDPA Prioritaire + Activation Checkpointing ready
 """
-NOUVEAUTÉS v9 :
-  ✅ FlashAttention-4 (Blackwell B200 SM100)
-      - Détection automatique FA4 → FA3 → FA2 → SDPA (fallback)
-      - FA4 compilé pour SM100 : ~2.5x vs FA2 BF16
-      - Compatible sequence packing (varlen / cu_seqlens)
+NOUVEAUTÉS v10 :
+  ✅ SDPA PyTorch 2.8 PRIORITAIRE sur flash_attn
+      - Sur B200 SM100 : SDPA = FA3 natif Blackwell (plus rapide que flash_attn 2.x)
+      - Sur H100 SM90  : SDPA = FA3 natif Hopper
+      - Sur A100 SM80  : SDPA = FA2 optimisé
+      - Aucune dépendance externe, toujours disponible avec PyTorch >= 2.0
+      - Compatible torch.compile + activation checkpointing
 
-  ✅ Sequence Packing
-      - Forward accepte cu_seqlens_q / cu_seqlens_k (optionnel)
-      - Si fournis → chemin varlen (flash_attn_varlen_func)
-      - Si absent  → comportement identique v8
+  ✅ flash_attn conservé UNIQUEMENT pour varlen (sequence packing)
+      - SDPA ne supporte pas cu_seqlens → flash_attn_varlen_func requis
+      - Si flash_attn absent : packing désactivé automatiquement, SDPA utilisé
 
-  ✅ Soft Cap conservé en option (None par défaut = désactivé)
-  ✅ KV Cache, GQA, QK-Norm, RoPE/YaRN : inchangés
+  ✅ Soft Cap, KV Cache, GQA, QK-Norm, RoPE/YaRN : inchangés
 
-HIÉRARCHIE FLASH ATTENTION :
-  1. FA4  (flash_attn >= 3.0, SM100 Blackwell)   → ~2.5x FA2
-  2. FA3  (flash_attn >= 2.6, SM90 Hopper)       → ~1.5x FA2
-  2. FA2  (flash_attn >= 2.0, SM80+)             → baseline
-  3. SDPA (PyTorch >= 2.0, toujours dispo)       → fallback
-  4. Manuel (soft_cap ou ancien PyTorch)         → dernier recours
+HIÉRARCHIE ATTENTION :
+  1. varlen  (flash_attn >= 2.0, cu_seqlens fournis) → sequence packing
+  2. SDPA    (PyTorch >= 2.0, prioritaire standard)   → FA3 natif sur B200/H100
+  3. Manuel  (soft_cap ou mask custom)               → dernier recours
 """
 
 import torch
@@ -37,69 +35,58 @@ _FA_VARLEN_FUNC = None # flash_attn_varlen_func si dispo
 _FA_FUNC        = None # flash_attn_func si dispo
 
 def _detect_flash_attn():
+    """
+    Détection de la meilleure backend d'attention disponible.
+
+    Stratégie v10 :
+      - SDPA PyTorch 2.8 est PRIORITAIRE car c'est FA3 natif sur B200/H100,
+        plus rapide que flash_attn 2.x, sans dépendance, et compatible compile.
+      - flash_attn est chargé UNIQUEMENT pour flash_attn_varlen_func
+        (sequence packing avec cu_seqlens) — SDPA ne supporte pas varlen.
+    """
     global _FA_LEVEL, _FA_VARLEN_FUNC, _FA_FUNC
+
+    # ── Priorité 1 : SDPA natif PyTorch ─────────────────────────
+    # Sur B200 SM100 : PyTorch 2.8 dispatche vers FA3 Blackwell nativement.
+    # C'est le chemin le plus rapide, le plus stable, et compatible compile.
+    if hasattr(F, 'scaled_dot_product_attention'):
+        _FA_LEVEL = 1
+        if torch.cuda.is_available():
+            cap = torch.cuda.get_device_capability()
+            if cap[0] >= 10:
+                print("  ⚡ SDPA PyTorch 2.8 — FA3 natif Blackwell SM100 (prioritaire)")
+            elif cap[0] >= 9:
+                print("  ⚡ SDPA PyTorch — FA3 natif Hopper SM90 (prioritaire)")
+            elif cap[0] >= 8:
+                print("  ⚡ SDPA PyTorch — FA2 natif Ampere SM80 (prioritaire)")
+            else:
+                print("  ⚡ SDPA PyTorch natif (prioritaire)")
+        else:
+            print("  ⚡ SDPA PyTorch natif (CPU)")
+    else:
+        print("  ⚠️  SDPA non disponible (PyTorch < 2.0) — performances dégradées")
+
+    # ── Priorité 2 : flash_attn pour varlen uniquement ───────────
+    # SDPA ne supporte pas cu_seqlens (sequence packing).
+    # On charge flash_attn SEULEMENT pour flash_attn_varlen_func.
+    # _FA_FUNC reste None → le chemin FA2/FA3/FA4 standard n'est pas utilisé,
+    # SDPA le remplace avantageusement.
     try:
         import flash_attn
         version = tuple(int(x) for x in flash_attn.__version__.split(".")[:2])
-
-        # FA4 — requires flash_attn >= 3.0 + SM100 (B200)
-        if version >= (3, 0):
-            if torch.cuda.is_available():
-                cap = torch.cuda.get_device_capability()
-                if cap == (12, 0) or cap[0] > 12:  # SM120 = Blackwell B200
-                    try:
-                        from flash_attn.flash_attn_interface import (
-                            flash_attn_func,
-                            flash_attn_varlen_func,
-                        )
-                        _FA_FUNC        = flash_attn_func
-                        _FA_VARLEN_FUNC = flash_attn_varlen_func
-                        _FA_LEVEL       = 4
-                        print("  ⚡ FlashAttention-4 (Blackwell SM120) détecté")
-                        return
-                    except ImportError:
-                        pass
-                # FA3 — SM90 Hopper / SM89 Ada
-                if cap[0] >= 9:
-                    try:
-                        from flash_attn.flash_attn_interface import (
-                            flash_attn_func,
-                            flash_attn_varlen_func,
-                        )
-                        _FA_FUNC        = flash_attn_func
-                        _FA_VARLEN_FUNC = flash_attn_varlen_func
-                        _FA_LEVEL       = 3
-                        print("  ⚡ FlashAttention-3 (Hopper SM90) détecté")
-                        return
-                    except ImportError:
-                        pass
-
-        # FA2 — flash_attn >= 2.0
         if version >= (2, 0):
-            try:
-                from flash_attn.flash_attn_interface import (
-                    flash_attn_func,
-                    flash_attn_varlen_func,
-                )
-                _FA_FUNC        = flash_attn_func
-                _FA_VARLEN_FUNC = flash_attn_varlen_func
-                _FA_LEVEL       = 2
-                print("  ⚡ FlashAttention-2 détecté")
-                return
-            except ImportError:
-                pass
-
-    except ImportError:
-        pass
-
-    # SDPA fallback
-    try:
-        F.scaled_dot_product_attention
-        _FA_LEVEL = 1
-        print("  ⚡ Flash Attention : SDPA PyTorch (fallback, pas de flash_attn installé)")
-    except AttributeError:
-        _FA_LEVEL = 0
-        print("  ⚠️  Aucune Flash Attention disponible (PyTorch < 2.0)")
+            from flash_attn.flash_attn_interface import flash_attn_varlen_func
+            _FA_VARLEN_FUNC = flash_attn_varlen_func
+            # _FA_LEVEL passe à 2 pour signaler que varlen est dispo
+            _FA_LEVEL = 2
+            print(f"  ⚡ flash_attn {flash_attn.__version__} — varlen uniquement (sequence packing)")
+        # _FA_FUNC reste intentionnellement None :
+        # le chemin standard utilise SDPA, pas flash_attn_func
+    except (ImportError, Exception):
+        _FA_VARLEN_FUNC = None
+        # Pas de flash_attn = pas de sequence packing, SDPA utilisé pour tout
+        if _FA_LEVEL == 1:
+            print("  ℹ️  flash_attn absent — sequence packing désactivé, SDPA pour tout")
 
 _detect_flash_attn()
 
@@ -327,68 +314,55 @@ class MultiHeadAttention(nn.Module):
             k = k.repeat_interleave(self.num_queries_per_kv, dim=1)
             v = v.repeat_interleave(self.num_queries_per_kv, dim=1)
 
-        # ── Attention — hiérarchie FA4 > FA3 > FA2 > SDPA > Manuel ──
+        # ── Attention — hiérarchie : varlen > SDPA > Manuel ────────
+        #
+        #  1. varlen  : sequence packing (cu_seqlens) via flash_attn_varlen_func
+        #               SDPA ne supporte pas cu_seqlens → flash_attn requis ici
+        #  2. SDPA    : chemin principal — FA3 natif sur B200/H100 via PyTorch 2.8
+        #               plus rapide que flash_attn 2.x, compatible compile
+        #  3. Manuel  : uniquement si soft_cap ou mask custom
+
         use_varlen = (cu_seqlens_q is not None
-                      and self._fa_level >= 2
                       and self._fa_varlen is not None
                       and self.soft_cap is None
                       and past_kv is None)
 
         if use_varlen:
-            # ── Chemin Sequence Packing (varlen) ─────────────────
-            # FA2 refuse float32 — cast bf16 obligatoire
+            # ── Chemin varlen — sequence packing ─────────────────
+            # flash_attn_varlen_func refuse float32 → cast bf16
             if q.dtype == torch.float32:
                 q = q.to(torch.bfloat16)
                 k = k.to(torch.bfloat16)
                 v = v.to(torch.bfloat16)
-            total_q = q.shape[2]
-            q_var = q.permute(0, 2, 1, 3).reshape(-1, self.num_heads,  self.head_dim)
-            k_var = k.permute(0, 2, 1, 3).reshape(-1, self.num_heads,  self.head_dim)
-            v_var = v.permute(0, 2, 1, 3).reshape(-1, self.num_heads,  self.head_dim)
-
+            q_var = q.permute(0, 2, 1, 3).reshape(-1, self.num_heads, self.head_dim)
+            k_var = k.permute(0, 2, 1, 3).reshape(-1, self.num_heads, self.head_dim)
+            v_var = v.permute(0, 2, 1, 3).reshape(-1, self.num_heads, self.head_dim)
             _msl_q = max_seqlen_q if max_seqlen_q is not None else seq_len
             _msl_k = max_seqlen_k if max_seqlen_k is not None else seq_len
-
             output = self._fa_varlen(
                 q_var, k_var, v_var,
                 cu_seqlens_q, cu_seqlens_k,
                 _msl_q, _msl_k,
-                dropout_p  = self.dropout.p if self.training else 0.0,
+                dropout_p     = self.dropout.p if self.training else 0.0,
                 softmax_scale = scale,
-                causal     = True,
+                causal        = True,
             )
-            output = output.reshape(batch_size, seq_len,
-                                    self.num_heads, self.head_dim)
+            output = output.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
             output = output.transpose(1, 2)
 
-        elif (self._fa_level >= 2
-              and self._fa_func is not None
-              and self.soft_cap is None
-              and mask is None):
-            # ── Chemin FA2/FA3/FA4 standard ──────────────────────
-            # flash_attn_func attend : [B, S, H, D]
-            # FA2 refuse float32 — cast en bf16 si nécessaire
+        elif self._sdpa_ok and self.soft_cap is None and mask is None:
+            # ── Chemin SDPA — prioritaire pour l'attention standard ──
+            # PyTorch 2.8 dispatche automatiquement vers le meilleur kernel :
+            #   SM100 (B200)  → FA3 Blackwell natif
+            #   SM90  (H100)  → FA3 Hopper natif
+            #   SM80  (A100)  → FA2 Ampere natif
+            # Cast bf16 si le modèle est en float32 (inférence sans .to(bf16))
             if q.dtype == torch.float32:
                 q = q.to(torch.bfloat16)
                 k = k.to(torch.bfloat16)
                 v = v.to(torch.bfloat16)
-            q_fa = q.transpose(1, 2)
-            k_fa = k.transpose(1, 2)
-            v_fa = v.transpose(1, 2)
             is_causal = (seq_len > 1 and past_kv is None)
-            output = self._fa_func(
-                q_fa, k_fa, v_fa,
-                dropout_p     = self.dropout.p if self.training else 0.0,
-                softmax_scale = scale,
-                causal        = is_causal,
-            )
-            output = output.transpose(1, 2)
-
-        elif (self._sdpa_ok
-              and self.soft_cap is None
-              and mask is None):
-            # ── Chemin SDPA (fallback PyTorch) ────────────────────
-            is_causal = (seq_len > 1 and past_kv is None)
+            orig_dtype = q.dtype
             output = F.scaled_dot_product_attention(
                 q, k, v,
                 attn_mask = None,
@@ -396,9 +370,11 @@ class MultiHeadAttention(nn.Module):
                 dropout_p = self.dropout.p if self.training else 0.0,
                 scale     = scale,
             )
+            if output.dtype != orig_dtype:
+                output = output.to(orig_dtype)
 
         else:
-            # ── Chemin Manuel (soft_cap ou mask custom) ───────────
+            # ── Chemin Manuel — soft_cap ou mask custom ───────────
             scores = torch.matmul(q, k.transpose(-2, -1)) * scale
             if self.soft_cap is not None:
                 scores = self.soft_cap * torch.tanh(scores / self.soft_cap)
@@ -422,6 +398,9 @@ class MultiHeadAttention(nn.Module):
         # ── Reshape + projection ─────────────────────────────────
         output = output.transpose(1, 2).contiguous()
         output = output.view(batch_size, seq_len, self.embed_dim)
+        # Aligne dtype sur out_proj.weight (évite mismatch bf16/float32 en inférence)
+        if output.dtype != self.out_proj.weight.dtype:
+            output = output.to(self.out_proj.weight.dtype)
         output = self.out_proj(output)
         output = self.dropout(output)
 
