@@ -27,7 +27,9 @@ import os
 
 os.environ["TORCHINDUCTOR_CACHE_DIR"]      = "./CompileCache"
 os.environ["TORCHINDUCTOR_FX_GRAPH_CACHE"] = "1"
+os.environ["TRITON_CACHE_DIR"]             = "./CompileCache/triton"
 os.makedirs("./CompileCache", exist_ok=True)
+os.makedirs("./CompileCache/triton", exist_ok=True)
 
 import torch
 # ── TF32 : +20% vitesse sur Ampere/Hopper/Blackwell, précision quasi-identique BF16
@@ -61,19 +63,20 @@ CONFIG = {
     'embed_dim':             1280,
     'num_heads':             20,
     'num_layers':            24,
-    'max_seq_len':           1024,
+    'max_seq_len':           2048,       # ✅ v10 : monté à 2048 (YaRN gère l'extension)
     'dropout':               0.0,
     'use_rope':              True,
-    'use_yarn':              False,
-    'yarn_scale':            4.0,
-    'yarn_original_max_len': 1024,
+    'use_yarn':              True,        # ✅ v10 : YaRN activé pour max_seq_len > 512
+    'yarn_scale':            4.0,         # 512 * 4 = 2048
+    'yarn_original_max_len': 512,         # longueur de training de base
     'use_swiglu':            True,
     'n_kv_heads':            5,
     'use_qk_norm':           True,
     'soft_cap':              None,
     'use_flash_attn':        True,
-    'batch_size':            60,
-    'gradient_accumulation': 8,
+    'use_gradient_checkpointing': True,   # ✅ v10 : ~50% VRAM, +30% compute
+    'batch_size':            16,        # ✅ v10 : réduit pour seq_len=2048 (OOM fix)
+    'gradient_accumulation': 32,       # batch effectif = 16*32 = 512 séquences
     'max_grad_norm':         1.0,
     'learning_rate':         4e-4,
     'weight_decay':          0.1,
@@ -87,10 +90,10 @@ CONFIG = {
     'warmup_ratio':          0.03,
     'decay_ratio':           0.15,
     'min_lr_ratio':          0.1,
-    'validate_every_steps':  500,
+    'validate_every_steps':  100,        # ✅ v10 : val plus fréquente (runs courts)
     'val_batches':           50,
     'shuffle_seed':          42,
-    'save_every_steps':      2000,
+    'save_every_steps':      200,        # ✅ v10 : checkpoint fréquent (runs courts)
     'checkpoint_file':       './Model/HessGpt_pretrain.pt',
     'use_compile':           True,
     'compile_mode':          'default',
@@ -824,6 +827,7 @@ def main():
         use_swiglu=CONFIG['use_swiglu'], n_kv_heads=CONFIG['n_kv_heads'],
         use_qk_norm=CONFIG['use_qk_norm'], soft_cap=CONFIG['soft_cap'],
         use_flash_attn=CONFIG['use_flash_attn'],
+        use_gradient_checkpointing=CONFIG['use_gradient_checkpointing'],
     ).to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
