@@ -107,11 +107,11 @@ DATASETS = [
         'split': 'train',
         'text_key': 'text',
         'streaming': True,
-        'description': 'Cosmopedia v2 sans filtre math 25%',
-        'tokens_per_chunk': 525_000_000,   # 25%
+        'description': 'Cosmopedia v2 sans filtre math 27.4%',
+        'tokens_per_chunk': 575_000_000,
         'int_score_min': 0,
         'lang_filter_mode': 'none',
-        'skip_general_filter': True,       # contenu pédago avec équations — garder
+        'skip_general_filter': True,
     },
     {
         'name': 'zyda2',
@@ -120,8 +120,8 @@ DATASETS = [
         'split': 'train',
         'text_key': 'text',
         'streaming': True,
-        'description': 'Zyda-2 20%',
-        'tokens_per_chunk': 420_000_000,   # 20%
+        'description': 'Zyda-2 22.4%',
+        'tokens_per_chunk': 470_000_000,
         'int_score_min': 0,
         'lang_filter_mode': 'none',
         'skip_general_filter': False,
@@ -133,11 +133,11 @@ DATASETS = [
         'split': 'train',
         'text_key': 'text',
         'streaming': True,
-        'description': 'FineWeb-Edu int_score>=4 18%',
-        'tokens_per_chunk': 378_000_000,   # 18%
+        'description': 'FineWeb-Edu int_score>=4 20.4%',
+        'tokens_per_chunk': 428_000_000,
         'int_score_min': 4,
         'lang_filter_mode': 'field',
-        'skip_general_filter': True,       # int_score>=4 suffit
+        'skip_general_filter': True,
     },
     {
         'name': 'finemath_4plus',
@@ -146,24 +146,11 @@ DATASETS = [
         'split': 'train',
         'text_key': 'text',
         'streaming': True,
-        'description': 'FineMath-4+ intro math 15%',
-        'tokens_per_chunk': 315_000_000,   # 15%
+        'description': 'FineMath-4+ intro math 17.4%',
+        'tokens_per_chunk': 365_000_000,
         'int_score_min': 0,
         'lang_filter_mode': 'none',
         'skip_general_filter': True,
-    },
-    {
-        'name': 'dclm_baseline',
-        'source': 'mlfoundations/dclm-baseline-1.0',
-        'config': None,
-        'split': 'train',
-        'text_key': 'text',
-        'streaming': True,
-        'description': 'DCLM anti-forgetting 12%',
-        'tokens_per_chunk': 252_000_000,   # 12%
-        'int_score_min': 0,
-        'lang_filter_mode': 'fasttext',
-        'skip_general_filter': False,
     },
     {
         'name': 'pes2o',
@@ -172,8 +159,8 @@ DATASETS = [
         'split': 'train',
         'text_key': 'text',
         'streaming': True,
-        'description': 'peS2o sciences 5%',
-        'tokens_per_chunk': 105_000_000,   # 5%
+        'description': 'peS2o sciences 7.4%',
+        'tokens_per_chunk': 155_000_000,
         'int_score_min': 0,
         'lang_filter_mode': 'none',
         'skip_general_filter': True,
